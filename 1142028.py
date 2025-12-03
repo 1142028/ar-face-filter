@@ -8,6 +8,7 @@ import math # 用於數學計算，如弧度轉換
 # --- 設定路徑 ---
 MODEL_PATH = 'face_landmarker.task'
 SUNGLASSES_PATH = 'sunglasses.png'
+JOJO_PATH = 'JOJO.png'
 
 # --- 1. 影像處理工具函式 ---
 
@@ -202,6 +203,74 @@ def apply_sunglasses_filter(frame, landmarks, sunglasses_img, W, H):
         
     return frame
 
+def apply_image_behind_head(frame, landmarks, overlay_img, W, H):
+    """
+    將 `overlay_img` 放在頭的後方（看起來在頭後面），透過先將 overlay 畫到畫面上，
+    再用臉部前景遮罩把原始人臉像素蓋回來，達到遮擋關係（人臉在前，JOJO 在後）。
+    """
+    orig = frame.copy()
+
+    # 使用左右眼外側與鼻尖計算位置與大小
+    x_left = int(landmarks[226].x * W)
+    y_left = int(landmarks[226].y * H)
+    x_right = int(landmarks[350].x * W)
+    y_right = int(landmarks[350].y * H)
+
+    nose_x = int(landmarks[4].x * W)
+    nose_y = int(landmarks[4].y * H)
+
+    # 中心與尺寸估計
+    center_x = (x_left + x_right) // 2
+    center_y = (nose_y + (y_left + y_right) // 2) // 2
+
+    eye_distance = np.sqrt((x_right - x_left) ** 2 + (y_right - y_left) ** 2)
+    target_width = int(eye_distance * 3.0)
+
+    # 確保 overlay_img 有 alpha 通道
+    if overlay_img is None:
+        return frame
+
+    if overlay_img.ndim == 3 and overlay_img.shape[2] == 3:
+        b, g, r = cv2.split(overlay_img)
+        alpha = np.ones(b.shape, dtype=b.dtype) * 255
+        overlay_img = cv2.merge((b, g, r, alpha))
+
+    # 縮放並旋轉 overlay
+    ol_H, ol_W = overlay_img.shape[:2]
+    scale_factor = target_width / float(ol_W)
+    resized = cv2.resize(overlay_img, (target_width, int(ol_H * scale_factor)), interpolation=cv2.INTER_AREA)
+
+    angle_rad = math.atan2(y_right - y_left, x_right - x_left)
+    angle_deg = -np.degrees(angle_rad)
+    rotated = rotate_image(resized, angle_deg)
+
+    overlay_bgr = rotated[:, :, :3]
+    overlay_alpha = rotated[:, :, 3] / 255.0
+
+    # 放置位置：以頭部中心為基準，可微調
+    x_pos = center_x - rotated.shape[1] // 2
+    y_pos = center_y - rotated.shape[0] // 2 + int(eye_distance * 0.15)
+
+    # 先把 JOJO 畫到畫面上
+    frame = overlay_image_alpha(frame, overlay_bgr, (x_pos, y_pos), overlay_alpha)
+
+    # 建立臉部遮罩（使用所有關鍵點的凸包）
+    pts = []
+    for lm in landmarks:
+        pts.append([int(lm.x * W), int(lm.y * H)])
+    pts = np.array(pts, dtype=np.int32)
+
+    if pts.shape[0] >= 3:
+        hull = cv2.convexHull(pts)
+        mask = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillConvexPoly(mask, hull, 255)
+
+        # 將原始人臉區域蓋回來，確保人臉在前景
+        mask_3 = mask[:, :, np.newaxis] / 255.0
+        frame = (orig * mask_3 + frame * (1 - mask_3)).astype(np.uint8)
+
+    return frame
+
 # --- 2. 初始化 MediaPipe Face Landmarker ---
 
 BaseOptions = mp.tasks.BaseOptions
@@ -216,6 +285,15 @@ try:
         raise FileNotFoundError(f"無法載入圖片：{SUNGLASSES_PATH}。請檢查路徑和檔案是否存在。")
     if sunglasses.ndim < 3 or sunglasses.shape[2] < 4:
         raise ValueError("載入的墨鏡圖片不是帶有透明度 (4通道) 的 PNG 圖片。請更換檔案。")
+    # 載入 JOJO 貼圖（會放在頭後面）
+    jojo = cv2.imread(JOJO_PATH, cv2.IMREAD_UNCHANGED)
+    if jojo is None:
+        raise FileNotFoundError(f"無法載入圖片：{JOJO_PATH}。請檢查路徑和檔案是否存在。")
+    # 若 JOJO 沒有 alpha 通道，補上不透明的 alpha
+    if jojo.ndim == 3 and jojo.shape[2] == 3:
+        b, g, r = cv2.split(jojo)
+        alpha = np.ones(b.shape, dtype=b.dtype) * 255
+        jojo = cv2.merge((b, g, r, alpha))
     
     # 建立 Face Landmarker 選項
     options = FaceLandmarkerOptions(
@@ -270,8 +348,8 @@ try:
         if face_landmarker_result.face_landmarks:
             landmarks = face_landmarker_result.face_landmarks[0]
             
-            # 呼叫墨鏡繪製函式
-            frame = apply_sunglasses_filter(frame, landmarks, sunglasses, W, H) 
+                # 呼叫將 JOJO 放在頭後方的函式（人臉區域會蓋回來以呈現前景）
+            frame = apply_image_behind_head(frame, landmarks, jojo, W, H)
         
         # 4. 顯示結果
         cv2.imshow('Python Sunglasses Filter (Press Q to exit)', frame)
